@@ -7,6 +7,8 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+// Instructions.h：定义了 Instruction class 的子类
+// Instruction.h：所有 LLVM 指令的基类
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -49,6 +51,7 @@ enum Token {
   tok_number = -5,
 
   // control
+  // 增加if和for相关的token
   tok_if = -6,
   tok_then = -7,
   tok_else = -8,
@@ -76,6 +79,7 @@ static int gettok() {
       return tok_def;
     if (IdentifierStr == "extern")
       return tok_extern;
+    // 处理相关的 关键字,以返回相应的token
     if (IdentifierStr == "if")
       return tok_if;
     if (IdentifierStr == "then")
@@ -181,6 +185,7 @@ public:
 };
 
 /// IfExprAST - Expression class for if/then/else.
+// if的抽象语法树,参照C++的 ?:
 class IfExprAST : public ExprAST {
   std::unique_ptr<ExprAST> Cond, Then, Else;
 
@@ -193,6 +198,7 @@ public:
 };
 
 /// ForExprAST - Expression class for for/in.
+// for的抽象语法树,参照C++的 for(double i=Start;i!=End;i+=Step)
 class ForExprAST : public ExprAST {
   std::string VarName;
   std::unique_ptr<ExprAST> Start, End, Step, Body;
@@ -333,6 +339,7 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
 }
 
 /// ifexpr ::= 'if' expression 'then' expression 'else' expression
+// 解析if的结构
 static std::unique_ptr<ExprAST> ParseIfExpr() {
   getNextToken(); // eat the if.
 
@@ -363,6 +370,7 @@ static std::unique_ptr<ExprAST> ParseIfExpr() {
 }
 
 /// forexpr ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
+// 解析for的结构
 static std::unique_ptr<ExprAST> ParseForExpr() {
   getNextToken(); // eat the for.
 
@@ -424,6 +432,7 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
     return ParseNumberExpr();
   case '(':
     return ParseParenExpr();
+  // 增加对if和for的判断
   case tok_if:
     return ParseIfExpr();
   case tok_for:
@@ -618,6 +627,7 @@ Value *CallExprAST::codegen() {
   return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
 }
 
+// if代码生成
 Value *IfExprAST::codegen() {
   Value *CondV = Cond->codegen();
   if (!CondV)
