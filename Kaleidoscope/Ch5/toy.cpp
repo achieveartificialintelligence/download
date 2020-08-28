@@ -634,9 +634,11 @@ Value *IfExprAST::codegen() {
     return nullptr;
 
   // Convert condition to a bool by comparing non-equal to 0.0.
+  // 生成i1的值
   CondV = Builder.CreateFCmpONE(
       CondV, ConstantFP::get(TheContext, APFloat(0.0)), "ifcond");
 
+  // 获取函数位置
   Function *TheFunction = Builder.GetInsertBlock()->getParent();
 
   // Create blocks for the then and else cases.  Insert the 'then' block at the
@@ -645,27 +647,32 @@ Value *IfExprAST::codegen() {
   BasicBlock *ElseBB = BasicBlock::Create(TheContext, "else");
   BasicBlock *MergeBB = BasicBlock::Create(TheContext, "ifcont");
 
+  // 创建br指令
   Builder.CreateCondBr(CondV, ThenBB, ElseBB);
 
   // Emit then value.
   Builder.SetInsertPoint(ThenBB);
 
+  // Then代码生成
   Value *ThenV = Then->codegen();
   if (!ThenV)
     return nullptr;
 
+  // 创建then->ifcont
   Builder.CreateBr(MergeBB);
   // Codegen of 'Then' can change the current block, update ThenBB for the PHI.
+  // 更新phi值
   ThenBB = Builder.GetInsertBlock();
 
   // Emit else block.
   TheFunction->getBasicBlockList().push_back(ElseBB);
+  // 设置代码插入点
   Builder.SetInsertPoint(ElseBB);
-
+  // 代码生成
   Value *ElseV = Else->codegen();
   if (!ElseV)
     return nullptr;
-
+  // 创建else->ifcont
   Builder.CreateBr(MergeBB);
   // Codegen of 'Else' can change the current block, update ElseBB for the PHI.
   ElseBB = Builder.GetInsertBlock();
@@ -673,8 +680,9 @@ Value *IfExprAST::codegen() {
   // Emit merge block.
   TheFunction->getBasicBlockList().push_back(MergeBB);
   Builder.SetInsertPoint(MergeBB);
+  // 生成phi指令
   PHINode *PN = Builder.CreatePHI(Type::getDoubleTy(TheContext), 2, "iftmp");
-
+  // 添加then和else的 [value,label]
   PN->addIncoming(ThenV, ThenBB);
   PN->addIncoming(ElseV, ElseBB);
   return PN;
@@ -697,6 +705,7 @@ Value *IfExprAST::codegen() {
 // outloop:
 Value *ForExprAST::codegen() {
   // Emit the start code first, without 'variable' in scope.
+  // 获得循环初始值
   Value *StartVal = Start->codegen();
   if (!StartVal)
     return nullptr;
@@ -704,10 +713,13 @@ Value *ForExprAST::codegen() {
   // Make the new basic block for the loop header, inserting after current
   // block.
   Function *TheFunction = Builder.GetInsertBlock()->getParent();
+  // 记录陷入位置
   BasicBlock *PreheaderBB = Builder.GetInsertBlock();
+  // 创建loop的Basic Block
   BasicBlock *LoopBB = BasicBlock::Create(TheContext, "loop", TheFunction);
 
   // Insert an explicit fall through from the current block to the LoopBB.
+  // 创建br陷入loop
   Builder.CreateBr(LoopBB);
 
   // Start insertion in LoopBB.
@@ -716,20 +728,24 @@ Value *ForExprAST::codegen() {
   // Start the PHI node with an entry for Start.
   PHINode *Variable =
       Builder.CreatePHI(Type::getDoubleTy(TheContext), 2, VarName);
+  // 插入起始 value->label
   Variable->addIncoming(StartVal, PreheaderBB);
 
   // Within the loop, the variable is defined equal to the PHI node.  If it
   // shadows an existing variable, we have to restore it, so save it now.
+  // 保存旧值,获取新值
   Value *OldVal = NamedValues[VarName];
   NamedValues[VarName] = Variable;
 
   // Emit the body of the loop.  This, like any other expr, can change the
   // current BB.  Note that we ignore the value computed by the body, but don't
   // allow an error.
+  // 生成循环体代码
   if (!Body->codegen())
     return nullptr;
 
   // Emit the step value.
+  // 默认步长为1.0
   Value *StepVal = nullptr;
   if (Step) {
     StepVal = Step->codegen();
@@ -739,15 +755,17 @@ Value *ForExprAST::codegen() {
     // If not specified, use 1.0.
     StepVal = ConstantFP::get(TheContext, APFloat(1.0));
   }
-
+  // 创建NextVar为 当前变量+步长
   Value *NextVar = Builder.CreateFAdd(Variable, StepVal, "nextvar");
 
   // Compute the end condition.
+  // 生成 退出条件判断 代码
   Value *EndCond = End->codegen();
   if (!EndCond)
     return nullptr;
 
   // Convert condition to a bool by comparing non-equal to 0.0.
+  // 判断退出条件
   EndCond = Builder.CreateFCmpONE(
       EndCond, ConstantFP::get(TheContext, APFloat(0.0)), "loopcond");
 
@@ -766,6 +784,7 @@ Value *ForExprAST::codegen() {
   Variable->addIncoming(NextVar, LoopEndBB);
 
   // Restore the unshadowed variable.
+  // 保存最后一次符合的变量值，而非退出时的变量值
   if (OldVal)
     NamedValues[VarName] = OldVal;
   else
