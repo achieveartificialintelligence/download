@@ -1,2 +1,2 @@
 # download
-for downloading
+这里是我的其他项目所用到的源文件的下载仓库，以GPLv3标准发行。
