@@ -90,9 +90,9 @@ static int gettok() {
       return tok_for;
     if (IdentifierStr == "in")
       return tok_in;
-    if (IdentifierStr == "binary")
+    if (IdentifierStr == "binary") // 二元操作符
       return tok_binary;
-    if (IdentifierStr == "unary")
+    if (IdentifierStr == "unary") // 一元操作符
       return tok_unary;
     return tok_identifier;
   }
@@ -164,8 +164,8 @@ public:
 
 /// UnaryExprAST - Expression class for a unary operator.
 class UnaryExprAST : public ExprAST {
-  char Opcode;
-  std::unique_ptr<ExprAST> Operand;
+  char Opcode;                      // 一元操作符
+  std::unique_ptr<ExprAST> Operand; // 一元操作数
 
 public:
   UnaryExprAST(char Opcode, std::unique_ptr<ExprAST> Operand)
@@ -176,8 +176,8 @@ public:
 
 /// BinaryExprAST - Expression class for a binary operator.
 class BinaryExprAST : public ExprAST {
-  char Op;
-  std::unique_ptr<ExprAST> LHS, RHS;
+  char Op;                           // 二元操作符
+  std::unique_ptr<ExprAST> LHS, RHS; // 左部右部
 
 public:
   BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS,
@@ -227,18 +227,17 @@ public:
   Value *codegen() override;
 };
 
-/// PrototypeAST - This class represents the "prototype" for a function,
-/// which captures its name, and its argument names (thus implicitly the number
-/// of arguments the function takes), as well as if it is an operator.
+// 利用函数声明的结构，来实现运算符的自定义
 class PrototypeAST {
   std::string Name;
   std::vector<std::string> Args;
-  bool IsOperator;
-  unsigned Precedence; // Precedence if a binary op.
+  bool IsOperator;     // 存储运算符
+  unsigned Precedence; // 存储二元运算符的优先级
 
 public:
   PrototypeAST(const std::string &Name, std::vector<std::string> Args,
                bool IsOperator = false, unsigned Prec = 0)
+      // 增加默认参数，实现对之前代码的兼容
       : Name(Name), Args(std::move(Args)), IsOperator(IsOperator),
         Precedence(Prec) {}
 
@@ -246,14 +245,17 @@ public:
   const std::string &getName() const { return Name; }
 
   bool isUnaryOp() const { return IsOperator && Args.size() == 1; }
+  // 判断一元运算符
   bool isBinaryOp() const { return IsOperator && Args.size() == 2; }
+  // 判断二元运算符
 
   char getOperatorName() const {
-    assert(isUnaryOp() || isBinaryOp());
+    assert(isUnaryOp() || isBinaryOp()); // 使用断言，来中止异常情况
     return Name[Name.size() - 1];
   }
 
   unsigned getBinaryPrecedence() const { return Precedence; }
+  // 返回非负优先级，最低优先级为0
 };
 
 /// FunctionAST - This class represents a function definition itself.
@@ -393,7 +395,7 @@ static std::unique_ptr<ExprAST> ParseIfExpr() {
     return nullptr;
 
   return std::make_unique<IfExprAST>(std::move(Cond), std::move(Then),
-                                      std::move(Else));
+                                     std::move(Else));
 }
 
 /// forexpr ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
@@ -439,7 +441,7 @@ static std::unique_ptr<ExprAST> ParseForExpr() {
     return nullptr;
 
   return std::make_unique<ForExprAST>(IdName, std::move(Start), std::move(End),
-                                       std::move(Step), std::move(Body));
+                                      std::move(Step), std::move(Body));
 }
 
 /// primary
@@ -469,11 +471,11 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
 ///   ::= primary
 ///   ::= '!' unary
 static std::unique_ptr<ExprAST> ParseUnary() {
-  // If the current token is not an operator, it must be a primary expr.
+  // 如果当前token不是 一元运算符，那就解析
   if (!isascii(CurTok) || CurTok == '(' || CurTok == ',')
     return ParsePrimary();
 
-  // If this is a unary operator, read it.
+  // 如果是 一元运算符 就存储
   int Opc = CurTok;
   getNextToken();
   if (auto Operand = ParseUnary())
@@ -592,7 +594,7 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
     return LogErrorP("Invalid number of operands for operator");
 
   return std::make_unique<PrototypeAST>(FnName, ArgNames, Kind != 0,
-                                         BinaryPrecedence);
+                                        BinaryPrecedence);
 }
 
 /// definition ::= 'def' prototype expression
@@ -612,7 +614,7 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
   if (auto E = ParseExpression()) {
     // Make an anonymous proto.
     auto Proto = std::make_unique<PrototypeAST>("__anon_expr",
-                                                 std::vector<std::string>());
+                                                std::vector<std::string>());
     return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
   }
   return nullptr;
@@ -1007,7 +1009,8 @@ static void HandleTopLevelExpression() {
 
       // Get the symbol's address and cast it to the right type (takes no
       // arguments, returns a double) so we can call it as a native function.
-      double (*FP)() = (double (*)())(intptr_t)cantFail(ExprSymbol.getAddress());
+      double (*FP)() =
+          (double (*)())(intptr_t)cantFail(ExprSymbol.getAddress());
       fprintf(stderr, "Evaluated to %f\n", FP());
 
       // Delete the anonymous expression module from the JIT.
