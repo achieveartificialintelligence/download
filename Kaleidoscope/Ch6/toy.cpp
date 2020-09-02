@@ -536,16 +536,16 @@ static std::unique_ptr<ExprAST> ParseExpression() {
 ///   ::= binary LETTER number? (id, id)
 ///   ::= unary LETTER (id)
 static std::unique_ptr<PrototypeAST> ParsePrototype() {
-  std::string FnName;
+  std::string FnName; // 函数名
 
   unsigned Kind = 0; // 0 = identifier, 1 = unary, 2 = binary.
-  unsigned BinaryPrecedence = 30;
+  unsigned BinaryPrecedence = 30;  // 二元运算符默认优先级
 
   switch (CurTok) {
   default:
     return LogErrorP("Expected function name in prototype");
   case tok_identifier:
-    FnName = IdentifierStr;
+    FnName = IdentifierStr; // 变量名
     Kind = 0;
     getNextToken();
     break;
@@ -554,7 +554,7 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
     if (!isascii(CurTok))
       return LogErrorP("Expected unary operator");
     FnName = "unary";
-    FnName += (char)CurTok;
+    FnName += (char)CurTok; // unary加上操作符名称
     Kind = 1;
     getNextToken();
     break;
@@ -563,12 +563,12 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
     if (!isascii(CurTok))
       return LogErrorP("Expected binary operator");
     FnName = "binary";
-    FnName += (char)CurTok;
+    FnName += (char)CurTok; // unary加上操作符名称
     Kind = 2;
     getNextToken();
 
     // Read the precedence if present.
-    if (CurTok == tok_number) {
+    if (CurTok == tok_number) { // 二元运算符运算符优先级
       if (NumVal < 1 || NumVal > 100)
         return LogErrorP("Invalid precedence: must be 1..100");
       BinaryPrecedence = (unsigned)NumVal;
@@ -577,6 +577,7 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
     break;
   }
 
+  // 默认函数解析
   if (CurTok != '(')
     return LogErrorP("Expected '(' in prototype");
 
@@ -589,10 +590,11 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
   // success.
   getNextToken(); // eat ')'.
 
-  // Verify right number of names for operator.
+  // 验证
   if (Kind && ArgNames.size() != Kind)
     return LogErrorP("Invalid number of operands for operator");
 
+  // Kind用来控制是否是操作符
   return std::make_unique<PrototypeAST>(FnName, ArgNames, Kind != 0,
                                         BinaryPrecedence);
 }
