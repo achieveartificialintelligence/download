@@ -1,4 +1,5 @@
-#include "llvm/ADT/STLExtras.h"
+#include "../include/KaleidoscopeJIT.h" // Kaleidoscope的JIT
+#include "llvm/ADT/STLExtras.h"         // llvm的STL拓展
 #include "llvm/Analysis/BasicAliasAnalysis.h"
 #include "llvm/Analysis/Passes.h"
 #include "llvm/IR/DIBuilder.h"
@@ -15,27 +16,21 @@
 #include <map>
 #include <string>
 #include <vector>
-#include "../include/KaleidoscopeJIT.h"
 
 using namespace llvm;
 using namespace llvm::orc;
 
 //===----------------------------------------------------------------------===//
-// Lexer
+// 词法分析部分
 //===----------------------------------------------------------------------===//
 
-// The lexer returns tokens [0-255] if it is an unknown character, otherwise one
-// of these for known things.
+// Token的枚举数组, 负数用于区分不同token, 正数用于存储 运算符 char类型的ASCII值
 enum Token {
-  tok_eof = -1,
-
-  // commands
-  tok_def = -2,
-  tok_extern = -3,
-
-  // primary
-  tok_identifier = -4,
-  tok_number = -5,
+  tok_eof = -1,        // ^D或^Z
+  tok_def = -2,        // 函数声明
+  tok_extern = -3,     // 拓展库函数
+  tok_identifier = -4, // 变量名
+  tok_number = -5,     // 数字
 
   // control
   tok_if = -6,
@@ -87,7 +82,7 @@ std::string getTokName(int Tok) {
 namespace {
 class PrototypeAST;
 class ExprAST;
-}
+} // namespace
 static LLVMContext TheContext;
 static IRBuilder<> Builder(TheContext);
 struct DebugInfo {
@@ -528,7 +523,7 @@ static std::unique_ptr<ExprAST> ParseIfExpr() {
     return nullptr;
 
   return std::make_unique<IfExprAST>(IfLoc, std::move(Cond), std::move(Then),
-                                      std::move(Else));
+                                     std::move(Else));
 }
 
 /// forexpr ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
@@ -574,7 +569,7 @@ static std::unique_ptr<ExprAST> ParseForExpr() {
     return nullptr;
 
   return std::make_unique<ForExprAST>(IdName, std::move(Start), std::move(End),
-                                       std::move(Step), std::move(Body));
+                                      std::move(Step), std::move(Body));
 }
 
 /// varexpr ::= 'var' identifier ('=' expression)?
@@ -701,7 +696,7 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
 
     // Merge LHS/RHS.
     LHS = std::make_unique<BinaryExprAST>(BinLoc, BinOp, std::move(LHS),
-                                           std::move(RHS));
+                                          std::move(RHS));
   }
 }
 
@@ -781,7 +776,7 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
     return LogErrorP("Invalid number of operands for operator");
 
   return std::make_unique<PrototypeAST>(FnLoc, FnName, ArgNames, Kind != 0,
-                                         BinaryPrecedence);
+                                        BinaryPrecedence);
 }
 
 /// definition ::= 'def' prototype expression
@@ -802,7 +797,7 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
   if (auto E = ParseExpression()) {
     // Make an anonymous proto.
     auto Proto = std::make_unique<PrototypeAST>(FnLoc, "__anon_expr",
-                                                 std::vector<std::string>());
+                                                std::vector<std::string>());
     return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
   }
   return nullptr;
@@ -1447,5 +1442,5 @@ int main() {
   // Print out all of the generated code.
   TheModule->print(errs(), nullptr);
 
-  return 0;
+  return 0; // 程序运行完成，返回值为0
 }
