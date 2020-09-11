@@ -1,24 +1,24 @@
 #include "../include/KaleidoscopeJIT.h" // Kaleidoscope的JIT
 #include "llvm/ADT/STLExtras.h"         // llvm的STL拓展
-#include "llvm/Analysis/BasicAliasAnalysis.h"
-#include "llvm/Analysis/Passes.h"
-#include "llvm/IR/DIBuilder.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/LLVMContext.h"
-#include "llvm/IR/LegacyPassManager.h"
-#include "llvm/IR/Module.h"
-#include "llvm/IR/Verifier.h"
-#include "llvm/Support/Host.h"
-#include "llvm/Support/TargetSelect.h"
-#include "llvm/Transforms/Scalar.h"
-#include <cctype>
-#include <cstdio>
-#include <map>
-#include <string>
-#include <vector>
+#include "llvm/Analysis/BasicAliasAnalysis.h" // LLVM 基础的 无状态和本地别名分析
+#include "llvm/Analysis/Passes.h" // 访问器函数的声明，其将pass用于分析库
+#include "llvm/IR/DIBuilder.h"   // 益于创建LLVM IR形式的debug信息
+#include "llvm/IR/IRBuilder.h"   // 统一且简单的LLVM指令创建接口
+#include "llvm/IR/LLVMContext.h" // global类型的容器
+#include "llvm/IR/LegacyPassManager.h" // 保存 维护 优化 pass的执行
+#include "llvm/IR/Module.h"            // LLVM IR对象的顶层容器
+#include "llvm/IR/Verifier.h"          // 函数校验
+#include "llvm/Support/Host.h"         // 宿主设备的基础信息
+#include "llvm/Support/TargetSelect.h" // 确保 目标的特定类被连接到主可执行文件，并合理初始化
+#include "llvm/Transforms/Scalar.h" // Scalar Pass
+#include <cctype>                   // 用于查看字符类型
+#include <cstdio>                   // 处理IO
+#include <map>                      // 用于名称与值的映射
+#include <string>                   // 字符串
+#include <vector>                   // 变长数组
 
-using namespace llvm;
-using namespace llvm::orc;
+using namespace llvm;      // 基础类
+using namespace llvm::orc; // ORC提供了模块API用于构建JIT编译器
 
 //===----------------------------------------------------------------------===//
 // 词法分析部分
@@ -26,27 +26,22 @@ using namespace llvm::orc;
 
 // Token的枚举数组, 负数用于区分不同token, 正数用于存储 运算符 char类型的ASCII值
 enum Token {
-  tok_eof = -1,        // ^D或^Z
+  tok_eof = -1,        // ^D 或 ^Z
   tok_def = -2,        // 函数声明
   tok_extern = -3,     // 拓展库函数
   tok_identifier = -4, // 变量名
   tok_number = -5,     // 数字
-
-  // control
-  tok_if = -6,
-  tok_then = -7,
-  tok_else = -8,
-  tok_for = -9,
-  tok_in = -10,
-
-  // operators
-  tok_binary = -11,
-  tok_unary = -12,
-
-  // var definition
-  tok_var = -13
+  tok_if = -6,         // 控制流 if
+  tok_then = -7,       // 控制流 then
+  tok_else = -8,       // 控制流 else
+  tok_for = -9,        // 控制流 for
+  tok_in = -10,        // 控制流 in
+  tok_binary = -11,    // 二元运算符
+  tok_unary = -12,     // 一元运算符
+  tok_var = -13        // 可变变量
 };
 
+// 返回token的名称
 std::string getTokName(int Tok) {
   switch (Tok) {
   case tok_eof:
@@ -76,58 +71,62 @@ std::string getTokName(int Tok) {
   case tok_var:
     return "var";
   }
-  return std::string(1, (char)Tok);
+  return std::string(1, (char)Tok); // 其他情况返回 Tok值
 }
 
 namespace {
-class PrototypeAST;
-class ExprAST;
+class PrototypeAST; // 函数声明AST
+class ExprAST;      // 表达式AST
 } // namespace
-static LLVMContext TheContext;
-static IRBuilder<> Builder(TheContext);
+static LLVMContext TheContext;          // 管理和global数据
+static IRBuilder<> Builder(TheContext); // IR生成器
 struct DebugInfo {
-  DICompileUnit *TheCU;
-  DIType *DblTy;
-  std::vector<DIScope *> LexicalBlocks;
+  // 遵循DWARF
+  DICompileUnit *TheCU; // Debug Information 调试信息编译单元
+  DIType *DblTy;        // 调试信息类型
+  std::vector<DIScope *> LexicalBlocks; // 调试词法作用域
 
-  void emitLocation(ExprAST *AST);
-  DIType *getDoubleTy();
-} KSDbgInfo;
+  void emitLocation(ExprAST *AST); // 为AST生成调试的代码位置信息
+  DIType *getDoubleTy();           // 返回调试信息类型
+} KSDbgInfo; // 生成一个调试信息对象, KaleidoscopeDebugInfo
 
+// 存储源代码行列位置
 struct SourceLocation {
-  int Line;
-  int Col;
+  int Line; // 行
+  int Col;  // 列
 };
-static SourceLocation CurLoc;
-static SourceLocation LexLoc = {1, 0};
+static SourceLocation CurLoc;          // 当前位置
+static SourceLocation LexLoc = {1, 0}; // 词法解析位置
 
+// 对每个读入的字符,先记录其位置,然后返回该字符
 static int advance() {
   int LastChar = getchar();
 
+  // linux:\n  windows: \r\n  macos: \r
   if (LastChar == '\n' || LastChar == '\r') {
-    LexLoc.Line++;
-    LexLoc.Col = 0;
+    LexLoc.Line++;  // 换行时,行数+1
+    LexLoc.Col = 0; // 列数清零
   } else
-    LexLoc.Col++;
-  return LastChar;
+    LexLoc.Col++;  // 未换行时,列数+1
+  return LastChar; // 返回当前字符
 }
 
-static std::string IdentifierStr; // Filled in if tok_identifier
-static double NumVal;             // Filled in if tok_number
+static std::string IdentifierStr; // 如果是 tok_identifier 会保存 变量名
+static double NumVal;             // 如果是 tok_number 会保存数值
 
-/// gettok - Return the next token from standard input.
+// 从输入中读取并返回token
 static int gettok() {
   static int LastChar = ' ';
 
-  // Skip any whitespace.
+  // 跳过所有空格
   while (isspace(LastChar))
     LastChar = advance();
-
+  // 词法解析的位置 传给 当前位置
   CurLoc = LexLoc;
-
-  if (isalpha(LastChar)) { // identifier: [a-zA-Z][a-zA-Z0-9]*
+  // 处理变量名和关键字: [a-zA-Z][a-zA-Z0-9]*
+  if (isalpha(LastChar)) { // [a-zA-Z]
     IdentifierStr = LastChar;
-    while (isalnum((LastChar = advance())))
+    while (isalnum((LastChar = advance()))) // [a-zA-Z0-9]*
       IdentifierStr += LastChar;
 
     if (IdentifierStr == "def")
@@ -152,97 +151,109 @@ static int gettok() {
       return tok_var;
     return tok_identifier;
   }
-
-  if (isdigit(LastChar) || LastChar == '.') { // Number: [0-9.]+
+  // 数字: [0-9.]+
+  if (isdigit(LastChar) || LastChar == '.') { // [0-9.]
     std::string NumStr;
     do {
       NumStr += LastChar;
       LastChar = advance();
-    } while (isdigit(LastChar) || LastChar == '.');
+    } while (isdigit(LastChar) || LastChar == '.'); // [0-9.]*
 
     NumVal = strtod(NumStr.c_str(), nullptr);
     return tok_number;
   }
-
+  // 注释作用于整行
   if (LastChar == '#') {
-    // Comment until end of line.
     do
       LastChar = advance();
     while (LastChar != EOF && LastChar != '\n' && LastChar != '\r');
 
-    if (LastChar != EOF)
+    if (LastChar != EOF) // 不是文件结束,就继续读取
       return gettok();
   }
 
-  // Check for end of file.  Don't eat the EOF.
+  // 文件结尾是最后一个字符,直接返回,不再继续读取
   if (LastChar == EOF)
     return tok_eof;
 
-  // Otherwise, just return the character as its ascii value.
+  // 其他情况,直接返回字符的ASCII值,用于我们自定义运算符的识别
   int ThisChar = LastChar;
   LastChar = advance();
   return ThisChar;
 }
 
 //===----------------------------------------------------------------------===//
-// Abstract Syntax Tree (aka Parse Tree)
+// 抽象语法树
 //===----------------------------------------------------------------------===//
 namespace {
-
+// 输出流
 raw_ostream &indent(raw_ostream &O, int size) {
+  // n个' '
   return O << std::string(size, ' ');
 }
 
-/// ExprAST - Base class for all expression nodes.
+/// 表达式抽象语法树, 是所有表达式的基类
 class ExprAST {
-  SourceLocation Loc;
+  SourceLocation Loc; // 代码位置
 
 public:
+  // 构造, 读取当前文件的代码位置,存入AST的Loc
   ExprAST(SourceLocation Loc = CurLoc) : Loc(Loc) {}
+  // 析构
   virtual ~ExprAST() {}
+  // 代码生成
   virtual Value *codegen() = 0;
+  // 输出行数
   int getLine() const { return Loc.Line; }
+  // 输出列数
   int getCol() const { return Loc.Col; }
+  // 输出行列数
   virtual raw_ostream &dump(raw_ostream &out, int ind) {
     return out << ':' << getLine() << ':' << getCol() << '\n';
   }
 };
 
-/// NumberExprAST - Expression class for numeric literals like "1.0".
+/// 数字表达式AST
 class NumberExprAST : public ExprAST {
-  double Val;
+  double Val; // 数值
 
 public:
   NumberExprAST(double Val) : Val(Val) {}
+  // 输出行列数
   raw_ostream &dump(raw_ostream &out, int ind) override {
     return ExprAST::dump(out << Val, ind);
   }
   Value *codegen() override;
 };
 
-/// VariableExprAST - Expression class for referencing a variable, like "a".
+// 变量表达式AST
 class VariableExprAST : public ExprAST {
-  std::string Name;
+  std::string Name; // 变量名
 
 public:
+  // 构造, 代码位置 变量名
   VariableExprAST(SourceLocation Loc, const std::string &Name)
       : ExprAST(Loc), Name(Name) {}
+  // 返回变量名
   const std::string &getName() const { return Name; }
   Value *codegen() override;
+  // 输出行列数
   raw_ostream &dump(raw_ostream &out, int ind) override {
     return ExprAST::dump(out << Name, ind);
   }
 };
 
-/// UnaryExprAST - Expression class for a unary operator.
+/// 一元运算符AST
 class UnaryExprAST : public ExprAST {
-  char Opcode;
-  std::unique_ptr<ExprAST> Operand;
+  char Opcode;                      // 运算符
+  std::unique_ptr<ExprAST> Operand; // 操作数
 
 public:
+  // 构造, 运算符 操作数
   UnaryExprAST(char Opcode, std::unique_ptr<ExprAST> Operand)
       : Opcode(Opcode), Operand(std::move(Operand)) {}
   Value *codegen() override;
+  // 输出行列数
   raw_ostream &dump(raw_ostream &out, int ind) override {
     ExprAST::dump(out << "unary" << Opcode, ind);
     Operand->dump(out, ind + 1);
@@ -250,16 +261,18 @@ public:
   }
 };
 
-/// BinaryExprAST - Expression class for a binary operator.
+// 二元运算符表达式AST
 class BinaryExprAST : public ExprAST {
-  char Op;
-  std::unique_ptr<ExprAST> LHS, RHS;
+  char Op;                           // 运算符
+  std::unique_ptr<ExprAST> LHS, RHS; // 左部,右部
 
 public:
+  // 获取代码位置,运算符,左部,右部
   BinaryExprAST(SourceLocation Loc, char Op, std::unique_ptr<ExprAST> LHS,
                 std::unique_ptr<ExprAST> RHS)
       : ExprAST(Loc), Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
   Value *codegen() override;
+  // 输出行列数
   raw_ostream &dump(raw_ostream &out, int ind) override {
     ExprAST::dump(out << "binary" << Op, ind);
     LHS->dump(indent(out, ind) << "LHS:", ind + 1);
@@ -268,16 +281,18 @@ public:
   }
 };
 
-/// CallExprAST - Expression class for function calls.
+/// 函数调用表达式AST
 class CallExprAST : public ExprAST {
-  std::string Callee;
-  std::vector<std::unique_ptr<ExprAST>> Args;
+  std::string Callee;                         // 被调用函数名
+  std::vector<std::unique_ptr<ExprAST>> Args; // 参数列表
 
 public:
+  // 代码位置,被调用函数名,参数列表
   CallExprAST(SourceLocation Loc, const std::string &Callee,
               std::vector<std::unique_ptr<ExprAST>> Args)
       : ExprAST(Loc), Callee(Callee), Args(std::move(Args)) {}
   Value *codegen() override;
+  // 输出行列数
   raw_ostream &dump(raw_ostream &out, int ind) override {
     ExprAST::dump(out << "call " << Callee, ind);
     for (const auto &Arg : Args)
@@ -286,16 +301,18 @@ public:
   }
 };
 
-/// IfExprAST - Expression class for if/then/else.
+/// if表达式AST if then else
 class IfExprAST : public ExprAST {
-  std::unique_ptr<ExprAST> Cond, Then, Else;
+  std::unique_ptr<ExprAST> Cond, Then, Else; // 条件,为true,为false
 
 public:
+  // 代码位置,条件,为true,为false
   IfExprAST(SourceLocation Loc, std::unique_ptr<ExprAST> Cond,
             std::unique_ptr<ExprAST> Then, std::unique_ptr<ExprAST> Else)
       : ExprAST(Loc), Cond(std::move(Cond)), Then(std::move(Then)),
         Else(std::move(Else)) {}
   Value *codegen() override;
+  // 输出行列数
   raw_ostream &dump(raw_ostream &out, int ind) override {
     ExprAST::dump(out << "if", ind);
     Cond->dump(indent(out, ind) << "Cond:", ind + 1);
@@ -305,18 +322,21 @@ public:
   }
 };
 
-/// ForExprAST - Expression class for for/in.
+/// for表达式AST for in
 class ForExprAST : public ExprAST {
-  std::string VarName;
+  std::string VarName; // 循环变量名
+  // 初始表达式,结束表达式,步长表达式,主体表达式
   std::unique_ptr<ExprAST> Start, End, Step, Body;
 
 public:
+  // 循环变量名,初始表达式,结束表达式,步长表达式,主体表达式
   ForExprAST(const std::string &VarName, std::unique_ptr<ExprAST> Start,
              std::unique_ptr<ExprAST> End, std::unique_ptr<ExprAST> Step,
              std::unique_ptr<ExprAST> Body)
       : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
         Step(std::move(Step)), Body(std::move(Body)) {}
   Value *codegen() override;
+  // 输出行列数
   raw_ostream &dump(raw_ostream &out, int ind) override {
     ExprAST::dump(out << "for", ind);
     Start->dump(indent(out, ind) << "Cond:", ind + 1);
@@ -327,17 +347,21 @@ public:
   }
 };
 
-/// VarExprAST - Expression class for var/in
+/// 可变变量表达式AST: var in
 class VarExprAST : public ExprAST {
+  // 存储可变变量的vector
   std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+  // 可变变量主体
   std::unique_ptr<ExprAST> Body;
 
 public:
   VarExprAST(
+      // 变量名,AST 组成的pair 的 vector
       std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames,
       std::unique_ptr<ExprAST> Body)
       : VarNames(std::move(VarNames)), Body(std::move(Body)) {}
-  Value *codegen() override;
+  Value *codegen() override; // 代码生成
+  // 输出行列数
   raw_ostream &dump(raw_ostream &out, int ind) override {
     ExprAST::dump(out << "var", ind);
     for (const auto &NamedVar : VarNames)
@@ -347,47 +371,54 @@ public:
   }
 };
 
-/// PrototypeAST - This class represents the "prototype" for a function,
-/// which captures its name, and its argument names (thus implicitly the number
-/// of arguments the function takes), as well as if it is an operator.
+// 函数声明AST 或 一元二元运算符表达式AST
 class PrototypeAST {
-  std::string Name;
-  std::vector<std::string> Args;
-  bool IsOperator;
-  unsigned Precedence; // Precedence if a binary op.
-  int Line;
+  std::string Name;              // 函数名
+  std::vector<std::string> Args; // 参数列表
+  bool IsOperator;               // 是否为运算符
+  unsigned Precedence;           // 二元运算符优先级
+  int Line;                      // 行数
 
 public:
+  // 代码位置,函数名,函数参数列表,是否为运算符,优先级
   PrototypeAST(SourceLocation Loc, const std::string &Name,
                std::vector<std::string> Args, bool IsOperator = false,
                unsigned Prec = 0)
       : Name(Name), Args(std::move(Args)), IsOperator(IsOperator),
         Precedence(Prec), Line(Loc.Line) {}
   Function *codegen();
+  // 获取函数名
   const std::string &getName() const { return Name; }
 
+  // 是否为一元运算符
   bool isUnaryOp() const { return IsOperator && Args.size() == 1; }
+  // 是否为二元运算符
   bool isBinaryOp() const { return IsOperator && Args.size() == 2; }
 
+  // 返回运算符名称,返回最后一个字符格式为:
+  // "unary"加上一个char字符,所以返回最后一个字符
   char getOperatorName() const {
     assert(isUnaryOp() || isBinaryOp());
     return Name[Name.size() - 1];
   }
-
+  // 获取二元运算符优先级
   unsigned getBinaryPrecedence() const { return Precedence; }
+  // 获取行数
   int getLine() const { return Line; }
 };
 
-/// FunctionAST - This class represents a function definition itself.
+/// 函数AST
 class FunctionAST {
-  std::unique_ptr<PrototypeAST> Proto;
-  std::unique_ptr<ExprAST> Body;
+  std::unique_ptr<PrototypeAST> Proto; // 函数声明
+  std::unique_ptr<ExprAST> Body;       // 函数体
 
 public:
+  // 函数声明,函数体
   FunctionAST(std::unique_ptr<PrototypeAST> Proto,
               std::unique_ptr<ExprAST> Body)
       : Proto(std::move(Proto)), Body(std::move(Body)) {}
   Function *codegen();
+  // 输出行列数
   raw_ostream &dump(raw_ostream &out, int ind) {
     indent(out, ind) << "FunctionAST\n";
     ++ind;
@@ -398,61 +429,63 @@ public:
 } // end anonymous namespace
 
 //===----------------------------------------------------------------------===//
-// Parser
+// 解析器
 //===----------------------------------------------------------------------===//
 
-/// CurTok/getNextToken - Provide a simple token buffer.  CurTok is the current
-/// token the parser is looking at.  getNextToken reads another token from the
-/// lexer and updates CurTok with its results.
-static int CurTok;
+static int CurTok; // 存储当前的Token枚举值(类型)
+// 从词法分析中获取下一个Token,并赋值给CurTok
 static int getNextToken() { return CurTok = gettok(); }
 
-/// BinopPrecedence - This holds the precedence for each binary operator that is
-/// defined.
+// 二元运算符的优先级,   运算符到优先级数字的映射
 static std::map<char, int> BinopPrecedence;
 
-/// GetTokPrecedence - Get the precedence of the pending binary operator token.
+// 查询二元运算符的优先级
 static int GetTokPrecedence() {
   if (!isascii(CurTok))
     return -1;
 
-  // Make sure it's a declared binop.
+  // 确保已经映射过
   int TokPrec = BinopPrecedence[CurTok];
   if (TokPrec <= 0)
     return -1;
   return TokPrec;
 }
 
-/// LogError* - These are little helper functions for error handling.
+// AST解析的错误提示
 std::unique_ptr<ExprAST> LogError(const char *Str) {
   fprintf(stderr, "Error: %s\n", Str);
   return nullptr;
 }
 
+// 函数声明解析的错误提示
 std::unique_ptr<PrototypeAST> LogErrorP(const char *Str) {
   LogError(Str);
   return nullptr;
 }
 
+// 表达式解析的声明
 static std::unique_ptr<ExprAST> ParseExpression();
 
-/// numberexpr ::= number
+// numberexpr ::= number
+// 数字解析
 static std::unique_ptr<ExprAST> ParseNumberExpr() {
   auto Result = std::make_unique<NumberExprAST>(NumVal);
-  getNextToken(); // consume the number
+  getNextToken();
   return std::move(Result);
 }
 
-/// parenexpr ::= '(' expression ')'
+// parenexpr ::= '(' expression ')'
+// 括号解析
 static std::unique_ptr<ExprAST> ParseParenExpr() {
   getNextToken(); // eat (.
+  // V为括号内表达式AST
   auto V = ParseExpression();
   if (!V)
     return nullptr;
-
+  // 判断结束条件
   if (CurTok != ')')
     return LogError("expected ')'");
-  getNextToken(); // eat ).
+  getNextToken();
   return V;
 }
 
@@ -460,20 +493,21 @@ static std::unique_ptr<ExprAST> ParseParenExpr() {
 ///   ::= identifier
 ///   ::= identifier '(' expression* ')'
 static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
-  std::string IdName = IdentifierStr;
+  std::string IdName = IdentifierStr; // 变量名
 
-  SourceLocation LitLoc = CurLoc;
+  SourceLocation LitLoc = CurLoc; // 当前代码位置
 
-  getNextToken(); // eat identifier.
-
-  if (CurTok != '(') // Simple variable ref.
+  getNextToken();
+  // 判断是变量还是函数
+  if (CurTok != '(')
     return std::make_unique<VariableExprAST>(LitLoc, IdName);
 
-  // Call.
-  getNextToken(); // eat (
+  // 函数调用
+  getNextToken();
   std::vector<std::unique_ptr<ExprAST>> Args;
   if (CurTok != ')') {
     while (1) {
+      // 解析参数
       if (auto Arg = ParseExpression())
         Args.push_back(std::move(Arg));
       else
@@ -488,31 +522,30 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
     }
   }
 
-  // Eat the ')'.
   getNextToken();
-
+  // 构造Call AST
   return std::make_unique<CallExprAST>(LitLoc, IdName, std::move(Args));
 }
 
 /// ifexpr ::= 'if' expression 'then' expression 'else' expression
 static std::unique_ptr<ExprAST> ParseIfExpr() {
-  SourceLocation IfLoc = CurLoc;
+  SourceLocation IfLoc = CurLoc; // 记录当前代码位置
 
-  getNextToken(); // eat the if.
+  getNextToken();
 
-  // condition.
+  // 判断条件
   auto Cond = ParseExpression();
   if (!Cond)
     return nullptr;
-
+  // then
   if (CurTok != tok_then)
     return LogError("expected then");
-  getNextToken(); // eat the then
+  getNextToken();
 
   auto Then = ParseExpression();
   if (!Then)
     return nullptr;
-
+  // else
   if (CurTok != tok_else)
     return LogError("expected else");
 
@@ -528,17 +561,17 @@ static std::unique_ptr<ExprAST> ParseIfExpr() {
 
 /// forexpr ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
 static std::unique_ptr<ExprAST> ParseForExpr() {
-  getNextToken(); // eat the for.
+  getNextToken();
 
   if (CurTok != tok_identifier)
     return LogError("expected identifier after for");
 
-  std::string IdName = IdentifierStr;
-  getNextToken(); // eat identifier.
-
+  std::string IdName = IdentifierStr; // 循环变量名
+  getNextToken();
+  // 初始赋值
   if (CurTok != '=')
     return LogError("expected '=' after for");
-  getNextToken(); // eat '='.
+  getNextToken();
 
   auto Start = ParseExpression();
   if (!Start)
@@ -546,12 +579,12 @@ static std::unique_ptr<ExprAST> ParseForExpr() {
   if (CurTok != ',')
     return LogError("expected ',' after for start value");
   getNextToken();
-
+  // 结束条件
   auto End = ParseExpression();
   if (!End)
     return nullptr;
 
-  // The step value is optional.
+  // 可选 步长
   std::unique_ptr<ExprAST> Step;
   if (CurTok == ',') {
     getNextToken();
@@ -563,7 +596,7 @@ static std::unique_ptr<ExprAST> ParseForExpr() {
   if (CurTok != tok_in)
     return LogError("expected 'in' after for");
   getNextToken(); // eat 'in'.
-
+  // for主体
   auto Body = ParseExpression();
   if (!Body)
     return nullptr;
@@ -575,19 +608,20 @@ static std::unique_ptr<ExprAST> ParseForExpr() {
 /// varexpr ::= 'var' identifier ('=' expression)?
 //                    (',' identifier ('=' expression)?)* 'in' expression
 static std::unique_ptr<ExprAST> ParseVarExpr() {
-  getNextToken(); // eat the var.
+  getNextToken();
 
-  std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+  std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>>
+      VarNames; // 可变变量列表
 
-  // At least one variable name is required.
+  // 至少需要一个参数
   if (CurTok != tok_identifier)
     return LogError("expected identifier after var");
 
   while (1) {
     std::string Name = IdentifierStr;
-    getNextToken(); // eat identifier.
+    getNextToken();
 
-    // Read the optional initializer.
+    // 初始化是可选的
     std::unique_ptr<ExprAST> Init = nullptr;
     if (CurTok == '=') {
       getNextToken(); // eat the '='.
@@ -599,7 +633,6 @@ static std::unique_ptr<ExprAST> ParseVarExpr() {
 
     VarNames.push_back(std::make_pair(Name, std::move(Init)));
 
-    // End of var list, exit loop.
     if (CurTok != ',')
       break;
     getNextToken(); // eat the ','.
@@ -608,11 +641,11 @@ static std::unique_ptr<ExprAST> ParseVarExpr() {
       return LogError("expected identifier list after var");
   }
 
-  // At this point, we have to have 'in'.
+  // in
   if (CurTok != tok_in)
     return LogError("expected 'in' keyword after 'var'");
-  getNextToken(); // eat 'in'.
-
+  getNextToken();
+  // 解析主体
   auto Body = ParseExpression();
   if (!Body)
     return nullptr;
@@ -627,22 +660,23 @@ static std::unique_ptr<ExprAST> ParseVarExpr() {
 ///   ::= ifexpr
 ///   ::= forexpr
 ///   ::= varexpr
+// 首要解析
 static std::unique_ptr<ExprAST> ParsePrimary() {
   switch (CurTok) {
   default:
     return LogError("unknown token when expecting an expression");
   case tok_identifier:
-    return ParseIdentifierExpr();
+    return ParseIdentifierExpr(); // 变量
   case tok_number:
-    return ParseNumberExpr();
+    return ParseNumberExpr(); // 数字
   case '(':
-    return ParseParenExpr();
+    return ParseParenExpr(); // 括号
   case tok_if:
-    return ParseIfExpr();
+    return ParseIfExpr(); // if
   case tok_for:
-    return ParseForExpr();
+    return ParseForExpr(); // for
   case tok_var:
-    return ParseVarExpr();
+    return ParseVarExpr(); // var
   }
 }
 
@@ -650,43 +684,43 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
 ///   ::= primary
 ///   ::= '!' unary
 static std::unique_ptr<ExprAST> ParseUnary() {
-  // If the current token is not an operator, it must be a primary expr.
+  // 在此判断是否为一元运算符, 否则就解析为Primary的表达式
   if (!isascii(CurTok) || CurTok == '(' || CurTok == ',')
     return ParsePrimary();
 
-  // If this is a unary operator, read it.
-  int Opc = CurTok;
+  // 解析一元运算符
+  int Opc = CurTok; // 运算符
   getNextToken();
-  if (auto Operand = ParseUnary())
-    return std::make_unique<UnaryExprAST>(Opc, std::move(Operand));
+  if (auto Operand = ParseUnary()) // 解析 主体表达式, 进入Primary解析
+    return std::make_unique<UnaryExprAST>(
+        Opc, std::move(Operand)); // 返回 一元运算符的AST
   return nullptr;
 }
 
 /// binoprhs
 ///   ::= ('+' unary)*
+// 解析 运算符+RHS的形式, 获取LHS和其左边运算符的优先级
 static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
                                               std::unique_ptr<ExprAST> LHS) {
-  // If this is a binop, find its precedence.
   while (1) {
+    // 为二元运算符获取优先级
     int TokPrec = GetTokPrecedence();
 
-    // If this is a binop that binds at least as tightly as the current binop,
-    // consume it, otherwise we are done.
+    // 如果当前运算符优先级小于前一运算符,直接返回LHS
     if (TokPrec < ExprPrec)
       return LHS;
 
-    // Okay, we know this is a binop.
+    // 获取二元运算符
     int BinOp = CurTok;
     SourceLocation BinLoc = CurLoc;
-    getNextToken(); // eat binop
+    getNextToken();
 
-    // Parse the unary expression after the binary operator.
+    // 解析RHS
     auto RHS = ParseUnary();
     if (!RHS)
       return nullptr;
 
-    // If BinOp binds less tightly with RHS than the operator after RHS, let
-    // the pending operator take RHS as its LHS.
+    // 判断此运算符优先级是否小于下一运算符
     int NextPrec = GetTokPrecedence();
     if (TokPrec < NextPrec) {
       RHS = ParseBinOpRHS(TokPrec + 1, std::move(RHS));
@@ -694,7 +728,7 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
         return nullptr;
     }
 
-    // Merge LHS/RHS.
+    // 解析完成,合并为 二元表达式的AST
     LHS = std::make_unique<BinaryExprAST>(BinLoc, BinOp, std::move(LHS),
                                           std::move(RHS));
   }
@@ -702,8 +736,9 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
 
 /// expression
 ///   ::= unary binoprhs
-///
+// 解析表达式
 static std::unique_ptr<ExprAST> ParseExpression() {
+  // 解析一元表达式,如果不是的话,会进行parse primary
   auto LHS = ParseUnary();
   if (!LHS)
     return nullptr;
@@ -715,14 +750,15 @@ static std::unique_ptr<ExprAST> ParseExpression() {
 ///   ::= id '(' id* ')'
 ///   ::= binary LETTER number? (id, id)
 ///   ::= unary LETTER (id)
+// 解析函数声明
 static std::unique_ptr<PrototypeAST> ParsePrototype() {
-  std::string FnName;
+  std::string FnName; // 函数名
 
-  SourceLocation FnLoc = CurLoc;
+  SourceLocation FnLoc = CurLoc; // 代码位置
 
-  unsigned Kind = 0; // 0 = identifier, 1 = unary, 2 = binary.
-  unsigned BinaryPrecedence = 30;
-
+  unsigned Kind = 0;              // 0 = identifier, 1 = unary, 2 = binary.
+  unsigned BinaryPrecedence = 30; // 默认优先级,在二元未给出优先级时使用
+  // 判断是变量,一元运算符,二元远算符
   switch (CurTok) {
   default:
     return LogErrorP("Expected function name in prototype");
@@ -736,7 +772,7 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
     if (!isascii(CurTok))
       return LogErrorP("Expected unary operator");
     FnName = "unary";
-    FnName += (char)CurTok;
+    FnName += (char)CurTok; // 函数名为 unary+运算符
     Kind = 1;
     getNextToken();
     break;
@@ -745,11 +781,11 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
     if (!isascii(CurTok))
       return LogErrorP("Expected binary operator");
     FnName = "binary";
-    FnName += (char)CurTok;
+    FnName += (char)CurTok; // 函数名为 binary+运算符
     Kind = 2;
     getNextToken();
 
-    // Read the precedence if present.
+    // 在给出优先级时使用给二元运算符
     if (CurTok == tok_number) {
       if (NumVal < 1 || NumVal > 100)
         return LogErrorP("Invalid precedence: must be 1..100");
@@ -758,44 +794,45 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
     }
     break;
   }
-
+  // 检查函数声明的括号
   if (CurTok != '(')
     return LogErrorP("Expected '(' in prototype");
-
+  // 参数列表
   std::vector<std::string> ArgNames;
   while (getNextToken() == tok_identifier)
     ArgNames.push_back(IdentifierStr);
   if (CurTok != ')')
     return LogErrorP("Expected ')' in prototype");
 
-  // success.
-  getNextToken(); // eat ')'.
+  getNextToken();
 
-  // Verify right number of names for operator.
+  // 验证运算符的类型和参数个数是否相符
   if (Kind && ArgNames.size() != Kind)
     return LogErrorP("Invalid number of operands for operator");
-
+  // 构造函数,Kind!=0用以返回布尔值
   return std::make_unique<PrototypeAST>(FnLoc, FnName, ArgNames, Kind != 0,
                                         BinaryPrecedence);
 }
 
 /// definition ::= 'def' prototype expression
+// 解析函数定义
 static std::unique_ptr<FunctionAST> ParseDefinition() {
-  getNextToken(); // eat def.
-  auto Proto = ParsePrototype();
+  getNextToken();
+  auto Proto = ParsePrototype(); // 函数声明
   if (!Proto)
     return nullptr;
 
-  if (auto E = ParseExpression())
+  if (auto E = ParseExpression()) // 函数体
     return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
   return nullptr;
 }
 
 /// toplevelexpr ::= expression
+// 将顶层表达式解析为匿名函数
 static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
   SourceLocation FnLoc = CurLoc;
   if (auto E = ParseExpression()) {
-    // Make an anonymous proto.
+    // 构建匿名函数声明, 未依照教程修改为main
     auto Proto = std::make_unique<PrototypeAST>(FnLoc, "__anon_expr",
                                                 std::vector<std::string>());
     return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
@@ -804,17 +841,18 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 }
 
 /// external ::= 'extern' prototype
+// 解析extern
 static std::unique_ptr<PrototypeAST> ParseExtern() {
   getNextToken(); // eat extern.
   return ParsePrototype();
 }
 
 //===----------------------------------------------------------------------===//
-// Debug Info Support
+// 调试信息
 //===----------------------------------------------------------------------===//
 
-static std::unique_ptr<DIBuilder> DBuilder;
-
+static std::unique_ptr<DIBuilder> DBuilder; // Debug Builder
+// DI获取double类型
 DIType *DebugInfo::getDoubleTy() {
   if (DblTy)
     return DblTy;
@@ -822,10 +860,11 @@ DIType *DebugInfo::getDoubleTy() {
   DblTy = DBuilder->createBasicType("double", 64, dwarf::DW_ATE_float);
   return DblTy;
 }
-
+// 为AST,生成DI的代码位置，更新Builder的位置记录
 void DebugInfo::emitLocation(ExprAST *AST) {
   if (!AST)
     return Builder.SetCurrentDebugLocation(DebugLoc());
+  // 记录作用域信息
   DIScope *Scope;
   if (LexicalBlocks.empty())
     Scope = TheCU;
@@ -834,14 +873,14 @@ void DebugInfo::emitLocation(ExprAST *AST) {
   Builder.SetCurrentDebugLocation(
       DebugLoc::get(AST->getLine(), AST->getCol(), Scope));
 }
-
+// 创建函数DI,包含函数参数数量,文件位置和名
 static DISubroutineType *CreateFunctionType(unsigned NumArgs, DIFile *Unit) {
   SmallVector<Metadata *, 8> EltTys;
   DIType *DblTy = KSDbgInfo.getDoubleTy();
 
-  // Add the result type.
+  // 结果的类型Double
   EltTys.push_back(DblTy);
-
+  // 对应参数数量的类型
   for (unsigned i = 0, e = NumArgs; i != e; ++i)
     EltTys.push_back(DblTy);
 
@@ -849,98 +888,97 @@ static DISubroutineType *CreateFunctionType(unsigned NumArgs, DIFile *Unit) {
 }
 
 //===----------------------------------------------------------------------===//
-// Code Generation
+// 代码生成
 //===----------------------------------------------------------------------===//
 
-static std::unique_ptr<Module> TheModule;
-static std::map<std::string, AllocaInst *> NamedValues;
-static std::unique_ptr<KaleidoscopeJIT> TheJIT;
-static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
+static std::unique_ptr<Module> TheModule; // 构造module
+static std::map<std::string, AllocaInst *>
+    NamedValues; // 变量名到Alloca值的映射
+static std::unique_ptr<KaleidoscopeJIT> TheJIT; // 构造JIT
+static std::map<std::string, std::unique_ptr<PrototypeAST>>
+    FunctionProtos; // 函数名,函数声明AST
 
+// 代码生成时的错误处理
 Value *LogErrorV(const char *Str) {
   LogError(Str);
   return nullptr;
 }
-
+// 查找函数
 Function *getFunction(std::string Name) {
-  // First, see if the function has already been added to the current module.
+  // 查找module中是否已经定义了函数
   if (auto *F = TheModule->getFunction(Name))
     return F;
 
-  // If not, check whether we can codegen the declaration from some existing
-  // prototype.
+  // 未找到函数定义,查找函数声明
   auto FI = FunctionProtos.find(Name);
   if (FI != FunctionProtos.end())
     return FI->second->codegen();
 
-  // If no existing prototype exists, return null.
+  // 其他情况,返回空
   return nullptr;
 }
 
-/// CreateEntryBlockAlloca - Create an alloca instruction in the entry block of
-/// the function.  This is used for mutable variables etc.
+// 在entry的BasicBlock中 创建alloca指令,
+// 此处为可变变量所设,本次未经优化,可直接看到alloca指令
 static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
                                           StringRef VarName) {
   IRBuilder<> TmpB(&TheFunction->getEntryBlock(),
                    TheFunction->getEntryBlock().begin());
   return TmpB.CreateAlloca(Type::getDoubleTy(TheContext), nullptr, VarName);
 }
-
+// 生成数字代码
 Value *NumberExprAST::codegen() {
-  KSDbgInfo.emitLocation(this);
+  KSDbgInfo.emitLocation(this); // AST生成代码时发出该位置
   return ConstantFP::get(TheContext, APFloat(Val));
 }
-
+// 生成变量
 Value *VariableExprAST::codegen() {
-  // Look this variable up in the function.
+  // 在函数中查找变量
   Value *V = NamedValues[Name];
   if (!V)
     return LogErrorV("Unknown variable name");
 
-  KSDbgInfo.emitLocation(this);
-  // Load the value.
+  KSDbgInfo.emitLocation(this); // AST生成代码时发出该位置
+  // 加载变量
   return Builder.CreateLoad(V, Name.c_str());
 }
-
+// 生成一元运算符AST代码
 Value *UnaryExprAST::codegen() {
-  Value *OperandV = Operand->codegen();
+  Value *OperandV = Operand->codegen(); // 主体生成
   if (!OperandV)
     return nullptr;
-
+  // 查找函数 "unary"+运算符
   Function *F = getFunction(std::string("unary") + Opcode);
   if (!F)
     return LogErrorV("Unknown unary operator");
 
-  KSDbgInfo.emitLocation(this);
+  KSDbgInfo.emitLocation(this); // AST生成代码时发出该位置
   return Builder.CreateCall(F, OperandV, "unop");
 }
-
+// 生成二元运算符AST代码
 Value *BinaryExprAST::codegen() {
-  KSDbgInfo.emitLocation(this);
+  KSDbgInfo.emitLocation(this); // AST生成代码时发出该位置
 
-  // Special case '=' because we don't want to emit the LHS as an expression.
+  // 特别处理=，因为左部不需要解析为表达式
   if (Op == '=') {
-    // Assignment requires the LHS to be an identifier.
-    // This assume we're building without RTTI because LLVM builds that way by
-    // default.  If you build LLVM with RTTI this can be changed to a
-    // dynamic_cast for automatic error checking.
+    // 此处预设变量为Double类型
     VariableExprAST *LHSE = static_cast<VariableExprAST *>(LHS.get());
     if (!LHSE)
       return LogErrorV("destination of '=' must be a variable");
-    // Codegen the RHS.
+    // 生成右部
     Value *Val = RHS->codegen();
     if (!Val)
       return nullptr;
 
-    // Look up the name.
+    // 查找变量名是否定义
     Value *Variable = NamedValues[LHSE->getName()];
     if (!Variable)
       return LogErrorV("Unknown variable name");
-
+    // 存储函数值,函数名
     Builder.CreateStore(Val, Variable);
     return Val;
   }
-
+  // 表达式左部,右部
   Value *L = LHS->codegen();
   Value *R = RHS->codegen();
   if (!L || !R)
@@ -951,37 +989,39 @@ Value *BinaryExprAST::codegen() {
     return Builder.CreateFAdd(L, R, "addtmp");
   case '-':
     return Builder.CreateFSub(L, R, "subtmp");
+  case '/':
+    return Builder.CreateFDiv(L, R, "divtmp");
   case '*':
     return Builder.CreateFMul(L, R, "multmp");
   case '<':
     L = Builder.CreateFCmpULT(L, R, "cmptmp");
-    // Convert bool 0/1 to double 0.0 or 1.0
+    // 将0/1转换为Double
     return Builder.CreateUIToFP(L, Type::getDoubleTy(TheContext), "booltmp");
   default:
     break;
   }
 
-  // If it wasn't a builtin binary operator, it must be a user defined one. Emit
-  // a call to it.
+  // 如果不是内建二元运算符,那就是自定义的, 构造响应函数
   Function *F = getFunction(std::string("binary") + Op);
   assert(F && "binary operator not found!");
 
   Value *Ops[] = {L, R};
   return Builder.CreateCall(F, Ops, "binop");
 }
-
+// 函数调用生成代码
 Value *CallExprAST::codegen() {
-  KSDbgInfo.emitLocation(this);
+  KSDbgInfo.emitLocation(this); // AST生成代码时发出该位置
 
-  // Look up the name in the global module table.
+  // 查找被调函数名
   Function *CalleeF = getFunction(Callee);
   if (!CalleeF)
     return LogErrorV("Unknown function referenced");
 
-  // If argument mismatch error.
+  // 匹配参数个数
   if (CalleeF->arg_size() != Args.size())
     return LogErrorV("Incorrect # arguments passed");
 
+  // 参数解析
   std::vector<Value *> ArgsV;
   for (unsigned i = 0, e = Args.size(); i != e; ++i) {
     ArgsV.push_back(Args[i]->codegen());
@@ -991,56 +1031,57 @@ Value *CallExprAST::codegen() {
 
   return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
 }
-
+// 生成if
 Value *IfExprAST::codegen() {
-  KSDbgInfo.emitLocation(this);
-
+  KSDbgInfo.emitLocation(this); // AST生成代码时发出该位置
+  // 条件生成
   Value *CondV = Cond->codegen();
   if (!CondV)
     return nullptr;
 
-  // Convert condition to a bool by comparing non-equal to 0.0.
+  // 通过和0.0是否相等判断,生成i1布尔值
   CondV = Builder.CreateFCmpONE(
       CondV, ConstantFP::get(TheContext, APFloat(0.0)), "ifcond");
-
+  // 获取函数代码插入点
   Function *TheFunction = Builder.GetInsertBlock()->getParent();
 
-  // Create blocks for the then and else cases.  Insert the 'then' block at the
-  // end of the function.
+  // then块插入到函数后
   BasicBlock *ThenBB = BasicBlock::Create(TheContext, "then", TheFunction);
+  // else块
   BasicBlock *ElseBB = BasicBlock::Create(TheContext, "else");
+  // ifcont
   BasicBlock *MergeBB = BasicBlock::Create(TheContext, "ifcont");
-
+  // br语句
   Builder.CreateCondBr(CondV, ThenBB, ElseBB);
 
-  // Emit then value.
+  // then生成
   Builder.SetInsertPoint(ThenBB);
 
   Value *ThenV = Then->codegen();
   if (!ThenV)
     return nullptr;
-
+  // 创建then->ifcont
   Builder.CreateBr(MergeBB);
-  // Codegen of 'Then' can change the current block, update ThenBB for the PHI.
+  // 在phi中更新then
   ThenBB = Builder.GetInsertBlock();
 
-  // Emit else block.
+  // 生成else块
   TheFunction->getBasicBlockList().push_back(ElseBB);
   Builder.SetInsertPoint(ElseBB);
 
   Value *ElseV = Else->codegen();
   if (!ElseV)
     return nullptr;
-
+  // 创建else->ifcont
   Builder.CreateBr(MergeBB);
-  // Codegen of 'Else' can change the current block, update ElseBB for the PHI.
+  // 在phi中更新else
   ElseBB = Builder.GetInsertBlock();
 
-  // Emit merge block.
+  // 生成合并分支
   TheFunction->getBasicBlockList().push_back(MergeBB);
   Builder.SetInsertPoint(MergeBB);
   PHINode *PN = Builder.CreatePHI(Type::getDoubleTy(TheContext), 2, "iftmp");
-
+  // 添加then和else到phi中, [value,label]
   PN->addIncoming(ThenV, ThenBB);
   PN->addIncoming(ElseV, ElseBB);
   return PN;
@@ -1068,138 +1109,127 @@ Value *IfExprAST::codegen() {
 Value *ForExprAST::codegen() {
   Function *TheFunction = Builder.GetInsertBlock()->getParent();
 
-  // Create an alloca for the variable in the entry block.
+  // 为entry中变量用alloca创建
   AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
 
-  KSDbgInfo.emitLocation(this);
+  KSDbgInfo.emitLocation(this); // AST生成代码时发出该位置
 
-  // Emit the start code first, without 'variable' in scope.
+  // 获得循环的初始值
   Value *StartVal = Start->codegen();
   if (!StartVal)
     return nullptr;
 
-  // Store the value into the alloca.
+  // 将值存入alloca
   Builder.CreateStore(StartVal, Alloca);
 
-  // Make the new basic block for the loop header, inserting after current
-  // block.
+  // 在当前块后,插入loop
   BasicBlock *LoopBB = BasicBlock::Create(TheContext, "loop", TheFunction);
-
-  // Insert an explicit fall through from the current block to the LoopBB.
+  // br进入loop
   Builder.CreateBr(LoopBB);
-
-  // Start insertion in LoopBB.
+  // 记录loop的陷入位置
   Builder.SetInsertPoint(LoopBB);
 
-  // Within the loop, the variable is defined equal to the PHI node.  If it
-  // shadows an existing variable, we have to restore it, so save it now.
+  // 保存旧值,获取新值
   AllocaInst *OldVal = NamedValues[VarName];
   NamedValues[VarName] = Alloca;
 
-  // Emit the body of the loop.  This, like any other expr, can change the
-  // current BB.  Note that we ignore the value computed by the body, but don't
-  // allow an error.
+  // 生成loop
   if (!Body->codegen())
     return nullptr;
 
-  // Emit the step value.
+  // 生成步长
   Value *StepVal = nullptr;
   if (Step) {
     StepVal = Step->codegen();
     if (!StepVal)
       return nullptr;
   } else {
-    // If not specified, use 1.0.
+    // 默认1.0
     StepVal = ConstantFP::get(TheContext, APFloat(1.0));
   }
 
-  // Compute the end condition.
+  // 计算结束条件
   Value *EndCond = End->codegen();
   if (!EndCond)
     return nullptr;
 
-  // Reload, increment, and restore the alloca.  This handles the case where
-  // the body of the loop mutates the variable.
+  // 重新载入,增加,重新储存alloca,以更新可变变量
   Value *CurVar = Builder.CreateLoad(Alloca, VarName.c_str());
   Value *NextVar = Builder.CreateFAdd(CurVar, StepVal, "nextvar");
   Builder.CreateStore(NextVar, Alloca);
 
-  // Convert condition to a bool by comparing non-equal to 0.0.
+  // 获取布尔值,判断退出条件
   EndCond = Builder.CreateFCmpONE(
       EndCond, ConstantFP::get(TheContext, APFloat(0.0)), "loopcond");
 
-  // Create the "after loop" block and insert it.
+  // 创建after loop并插入
   BasicBlock *AfterBB =
       BasicBlock::Create(TheContext, "afterloop", TheFunction);
 
-  // Insert the conditional branch into the end of LoopEndBB.
+  // br语句
   Builder.CreateCondBr(EndCond, LoopBB, AfterBB);
 
-  // Any new code will be inserted in AfterBB.
+  // 后续代码都被插入after loop
   Builder.SetInsertPoint(AfterBB);
 
-  // Restore the unshadowed variable.
+  // 恢复旧值
   if (OldVal)
     NamedValues[VarName] = OldVal;
   else
     NamedValues.erase(VarName);
 
-  // for expr always returns 0.0.
+  // 返回值为0.0
   return Constant::getNullValue(Type::getDoubleTy(TheContext));
 }
 
+// 可变变量AST的代码生成函数
 Value *VarExprAST::codegen() {
-  std::vector<AllocaInst *> OldBindings;
-
+  std::vector<AllocaInst *> OldBindings; // 分配stack上内存
+  // 获取函数代码插入点
   Function *TheFunction = Builder.GetInsertBlock()->getParent();
 
-  // Register all variables and emit their initializer.
+  // 获取变量并初始化
   for (unsigned i = 0, e = VarNames.size(); i != e; ++i) {
-    const std::string &VarName = VarNames[i].first;
-    ExprAST *Init = VarNames[i].second.get();
+    const std::string &VarName = VarNames[i].first; // first变量名
+    ExprAST *Init = VarNames[i].second.get();       // 变量值
 
-    // Emit the initializer before adding the variable to scope, this prevents
-    // the initializer from referencing the variable itself, and permits stuff
-    // like this:
-    //  var a = 1 in
-    //    var a = a in ...   # refers to outer 'a'.
+    // 初始化
     Value *InitVal;
     if (Init) {
       InitVal = Init->codegen();
       if (!InitVal)
         return nullptr;
-    } else { // If not specified, use 0.0.
+    } else { // 初始化默认值为0.0
       InitVal = ConstantFP::get(TheContext, APFloat(0.0));
     }
-
+    // 在entry块中创建alloca指令
     AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
     Builder.CreateStore(InitVal, Alloca);
 
-    // Remember the old variable binding so that we can restore the binding when
-    // we unrecurse.
+    // 还原旧值, 为循环变量最后一次生效的值
     OldBindings.push_back(NamedValues[VarName]);
 
-    // Remember this binding.
+    // 还原绑定
     NamedValues[VarName] = Alloca;
   }
 
-  KSDbgInfo.emitLocation(this);
+  KSDbgInfo.emitLocation(this); // AST生成代码时发出该位置
 
-  // Codegen the body, now that all vars are in scope.
+  // 生成主体,所有可变变量都在域内
   Value *BodyVal = Body->codegen();
   if (!BodyVal)
     return nullptr;
 
-  // Pop all our variables from scope.
+  // 弹出可变变量从域内
   for (unsigned i = 0, e = VarNames.size(); i != e; ++i)
     NamedValues[VarNames[i].first] = OldBindings[i];
 
-  // Return the body computation.
+  // 返回主体计算值
   return BodyVal;
 }
-
+// 函数声明代码生成
 Function *PrototypeAST::codegen() {
-  // Make the function type:  double(double,double) etc.
+  // 构建:  double(double,double)
   std::vector<Type *> Doubles(Args.size(), Type::getDoubleTy(TheContext));
   FunctionType *FT =
       FunctionType::get(Type::getDoubleTy(TheContext), Doubles, false);
@@ -1207,7 +1237,7 @@ Function *PrototypeAST::codegen() {
   Function *F =
       Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
 
-  // Set names for all arguments.
+  // 为参数设置名
   unsigned Idx = 0;
   for (auto &Arg : F->args())
     Arg.setName(Args[Idx++]);
@@ -1216,50 +1246,50 @@ Function *PrototypeAST::codegen() {
 }
 
 Function *FunctionAST::codegen() {
-  // Transfer ownership of the prototype to the FunctionProtos map, but keep a
-  // reference to it for use below.
+
+  // 将函数声明转为函数, 保留引用为后续使用
   auto &P = *Proto;
   FunctionProtos[Proto->getName()] = std::move(Proto);
   Function *TheFunction = getFunction(P.getName());
   if (!TheFunction)
     return nullptr;
 
-  // If this is an operator, install it.
+  // 如果是二元运算符,记录其优先级
   if (P.isBinaryOp())
     BinopPrecedence[P.getOperatorName()] = P.getBinaryPrecedence();
 
-  // Create a new basic block to start insertion into.
+  // 创建entry BasicBlock
   BasicBlock *BB = BasicBlock::Create(TheContext, "entry", TheFunction);
   Builder.SetInsertPoint(BB);
 
-  // Create a subprogram DIE for this function.
+  // 根据CompileUnit和源代码中代码位置将函数定义添加到调试信息中
   DIFile *Unit = DBuilder->createFile(KSDbgInfo.TheCU->getFilename(),
                                       KSDbgInfo.TheCU->getDirectory());
   DIScope *FContext = Unit;
   unsigned LineNo = P.getLine();
   unsigned ScopeLine = LineNo;
+  // DISubprogram，其中包含对该函数所有元数据的引用
   DISubprogram *SP = DBuilder->createFunction(
       FContext, P.getName(), StringRef(), Unit, LineNo,
       CreateFunctionType(TheFunction->arg_size(), Unit), ScopeLine,
       DINode::FlagPrototyped, DISubprogram::SPFlagDefinition);
   TheFunction->setSubprogram(SP);
 
-  // Push the current scope.
+  // 为每个函数生成代码时，将作用域（函数）推到栈顶
   KSDbgInfo.LexicalBlocks.push_back(SP);
 
-  // Unset the location for the prologue emission (leading instructions with no
-  // location in a function are considered part of the prologue and the debugger
-  // will run past them when breaking on a function)
+  // 不为前序设置位置 函数中没有位置的引导指令被视为前序,
+  // 调试器会在中断函数时跳过
   KSDbgInfo.emitLocation(nullptr);
 
-  // Record the function arguments in the NamedValues map.
+  // NamedValues清空,并记录此次参数列表
   NamedValues.clear();
   unsigned ArgIdx = 0;
   for (auto &Arg : TheFunction->args()) {
     // Create an alloca for this variable.
     AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, Arg.getName());
 
-    // Create a debug descriptor for the variable.
+    // 为变量添加调试描述
     DILocalVariable *D = DBuilder->createParameterVariable(
         SP, Arg.getName(), ++ArgIdx, Unit, LineNo, KSDbgInfo.getDoubleTy(),
         true);
@@ -1268,61 +1298,59 @@ Function *FunctionAST::codegen() {
                             DebugLoc::get(LineNo, 0, SP),
                             Builder.GetInsertBlock());
 
-    // Store the initial value into the alloca.
+    // 将初始值存入 alloca
     Builder.CreateStore(&Arg, Alloca);
 
-    // Add arguments to variable symbol table.
+    // 将参数加入到变量符号表中
     NamedValues[std::string(Arg.getName())] = Alloca;
   }
 
-  KSDbgInfo.emitLocation(Body.get());
+  KSDbgInfo.emitLocation(Body.get()); // 函数主体生成代码,获得一个新位置
 
   if (Value *RetVal = Body->codegen()) {
-    // Finish off the function.
+    // 完成函数
     Builder.CreateRet(RetVal);
 
-    // Pop off the lexical block for the function.
+    // 函数的代码生成结束时将作用域弹出
     KSDbgInfo.LexicalBlocks.pop_back();
 
-    // Validate the generated code, checking for consistency.
+    // 验证函数
     verifyFunction(*TheFunction);
 
     return TheFunction;
   }
 
-  // Error reading body, remove function.
+  // 函数体读取错误,删除函数
   TheFunction->eraseFromParent();
 
   if (P.isBinaryOp())
     BinopPrecedence.erase(Proto->getOperatorName());
 
-  // Pop off the lexical block for the function since we added it
-  // unconditionally.
+  // 弹出函数的作用域
   KSDbgInfo.LexicalBlocks.pop_back();
-
+  // 生成无效
   return nullptr;
 }
 
 //===----------------------------------------------------------------------===//
-// Top-Level parsing and JIT Driver
+// 顶层解析和JIT
 //===----------------------------------------------------------------------===//
 
 static void InitializeModule() {
-  // Open a new module.
+  // 新建一个module
   TheModule = std::make_unique<Module>("my cool jit", TheContext);
   TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
 }
-
+// 处理函数定义,包括自定义的一元二元运算符
 static void HandleDefinition() {
   if (auto FnAST = ParseDefinition()) {
     if (!FnAST->codegen())
       fprintf(stderr, "Error reading function definition:");
   } else {
-    // Skip token for error recovery.
     getNextToken();
   }
 }
-
+// 处理extern的函数声明,一般用于使用拓展的库函数
 static void HandleExtern() {
   if (auto ProtoAST = ParseExtern()) {
     if (!ProtoAST->codegen())
@@ -1330,39 +1358,37 @@ static void HandleExtern() {
     else
       FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
   } else {
-    // Skip token for error recovery.
     getNextToken();
   }
 }
-
+// 处理顶层表达式,用以解析只有表达式的情况
 static void HandleTopLevelExpression() {
-  // Evaluate a top-level expression into an anonymous function.
   if (auto FnAST = ParseTopLevelExpr()) {
     if (!FnAST->codegen()) {
       fprintf(stderr, "Error generating code for top level expr");
     }
   } else {
-    // Skip token for error recovery.
     getNextToken();
   }
 }
 
 /// top ::= definition | external | expression | ';'
+// 主循环,负责跳转到不同的解析流程
 static void MainLoop() {
   while (1) {
     switch (CurTok) {
-    case tok_eof:
+    case tok_eof: // 检测到终止符，跳出循环
       return;
-    case ';': // ignore top-level semicolons.
+    case ';': // 忽略顶层表达式的分号
       getNextToken();
       break;
-    case tok_def:
+    case tok_def: // def开头的函数
       HandleDefinition();
       break;
-    case tok_extern:
+    case tok_extern: // extern开头的拓展库函数
       HandleExtern();
       break;
-    default:
+    default: // 默认情况下处理为顶层表达式
       HandleTopLevelExpression();
       break;
     }
@@ -1370,76 +1396,77 @@ static void MainLoop() {
 }
 
 //===----------------------------------------------------------------------===//
-// "Library" functions that can be "extern'd" from user code.
+// 拓展库函数
 //===----------------------------------------------------------------------===//
 
-#ifdef _WIN32
+#ifdef _WIN32 // Win32会自行定义,但是Mac不会
 #define DLLEXPORT __declspec(dllexport)
 #else
 #define DLLEXPORT
 #endif
 
-/// putchard - putchar that takes a double and returns 0.
+// 读取一个double数
 extern "C" DLLEXPORT double putchard(double X) {
   fputc((char)X, stderr);
   return 0;
 }
 
-/// printd - printf that takes a double prints it as "%f\n", returning 0.
+// 输出一个double数
 extern "C" DLLEXPORT double printd(double X) {
   fprintf(stderr, "%f\n", X);
   return 0;
 }
 
 //===----------------------------------------------------------------------===//
-// Main driver code.
+// 主程序部分
 //===----------------------------------------------------------------------===//
 
 int main() {
+  // 初始化本机参数
   InitializeNativeTarget();
   InitializeNativeTargetAsmPrinter();
   InitializeNativeTargetAsmParser();
 
-  // Install standard binary operators.
-  // 1 is lowest precedence.
+  // 存储二元运算符的优先级,0-100,越大越高
   BinopPrecedence['='] = 2;
   BinopPrecedence['<'] = 10;
   BinopPrecedence['+'] = 20;
   BinopPrecedence['-'] = 20;
-  BinopPrecedence['*'] = 40; // highest.
+  BinopPrecedence['/'] = 40;
+  BinopPrecedence['*'] = 40;
 
-  // Prime the first token.
+  // 读取第一个token
   getNextToken();
-
+  // 构建JIT
   TheJIT = std::make_unique<KaleidoscopeJIT>();
-
+  // 初始化Module
   InitializeModule();
 
-  // Add the current debug info version into the module.
+  //增加当前debug版本信息
   TheModule->addModuleFlag(Module::Warning, "Debug Info Version",
                            DEBUG_METADATA_VERSION);
 
-  // Darwin only supports dwarf2.
+  // Darwin 只支持 dwarf2.
   if (Triple(sys::getProcessTriple()).isOSDarwin())
     TheModule->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 2);
 
-  // Construct the DIBuilder, we do this here because we need the module.
+  // 用module构造Debug Info的Builder
   DBuilder = std::make_unique<DIBuilder>(*TheModule);
 
-  // Create the compile unit for the module.
-  // Currently down as "fib.ks" as a filename since we're redirecting stdin
-  // but we'd like actual source locations.
+  // 创建module的编译单元
+  // 从输入中获取代码是,存为fib.ks
+  // 推荐使用文件的实际路径
   KSDbgInfo.TheCU = DBuilder->createCompileUnit(
       dwarf::DW_LANG_C, DBuilder->createFile("fib.ks", "."),
       "Kaleidoscope Compiler", 0, "", 0);
 
-  // Run the main "interpreter loop" now.
+  // 进入程序的主循环
   MainLoop();
 
-  // Finalize the debug info.
+  // 完善debug信息
   DBuilder->finalize();
 
-  // Print out all of the generated code.
+  // 打印出所有生成的代码
   TheModule->print(errs(), nullptr);
 
   return 0; // 程序运行完成，返回值为0
